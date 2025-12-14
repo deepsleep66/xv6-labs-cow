@@ -303,9 +303,9 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   for(i = 0; i < sz; i += PGSIZE){
     pte = walk(old, i, 0);
     if(pte == 0)
-      continue;                 // 你有 lazy：页表项可能不存在
+      continue;                 
     if((*pte & PTE_V) == 0)
-      continue;                 // 你有 lazy：物理页可能还没分配
+      continue;               
 
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
@@ -313,20 +313,20 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     // 如果原来可写：父子都改成只读 + 打 COW 标记
     if(flags & PTE_W){
       flags = (flags & ~PTE_W) | PTE_COW;
-      *pte = PA2PTE(pa) | flags;     // 关键：父进程 PTE 也要改
+      *pte = PA2PTE(pa) | flags;    
     }
 
-    // 子进程映射到同一个物理页
+   
     if(mappages(new, i, PGSIZE, pa, flags) != 0){
       uvmunmap(new, 0, i/PGSIZE, 1);
       return -1;
     }
 
-    // 新增一个引用
+ 
     incref(pa);
   }
 
-  sfence_vma();  // 父 PTE 被改写，建议 flush
+  sfence_vma(); 
   return 0;
 }
 
@@ -353,14 +353,14 @@ cowalloc(pagetable_t pagetable, uint64 va)
   if((*pte & PTE_V) == 0) return 0;
   if((*pte & PTE_U) == 0) return 0;
 
-  // 不是 COW：写只读页应该 kill（交给上层：返回 0）
+
   if((*pte & PTE_COW) == 0)
     return 0;
 
   uint64 pa = PTE2PA(*pte);
   uint flags = PTE_FLAGS(*pte);
 
-  // 优化：如果只有一个引用，直接恢复可写即可，不必拷贝
+ 
   if(getref(pa) == 1){
     *pte = PA2PTE(pa) | ((flags | PTE_W) & ~PTE_COW);
     sfence_vma();
@@ -375,7 +375,6 @@ cowalloc(pagetable_t pagetable, uint64 va)
 
   *pte = PA2PTE((uint64)mem) | ((flags | PTE_W) & ~PTE_COW);
 
-  // 旧页少一个引用：用你改过的 kfree 做 refcount--
   kfree((void*)pa);
 
   sfence_vma();
@@ -407,7 +406,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
       return -1;
 
-    // 如果不可写但 COW：先拆页
+
     if(((*pte & PTE_W) == 0) && (*pte & PTE_COW)){
       if(cowalloc(pagetable, va0) == 0)
         return -1;
@@ -417,7 +416,6 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
       pte = walk(pagetable, va0, 0);
     }
 
-    // 仍不可写：拒绝（例如写只读 text）
     if((*pte & PTE_W) == 0)
       return -1;
 
@@ -520,15 +518,13 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 
   pte_t *pte = walk(pagetable, va, 0);
 
-  // 1) 已映射页的 fault：只处理 “写 COW”
   if(pte && (*pte & PTE_V)){
     if(read == 0){
-      return cowalloc(pagetable, va);   // 写入触发：尝试拆 COW
+      return cowalloc(pagetable, va);   
     }
-    return 0; // 读 fault 不应到这里；或非法读，交给 trap kill
+    return 0; 
   }
 
-  // 2) 未映射：lazy allocation（保留你原逻辑）
   uint64 mem = (uint64)kalloc();
   if(mem == 0)
     return 0;
