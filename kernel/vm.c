@@ -299,29 +299,37 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      continue;   // page table entry hasn't been allocated
+    pte = walk(old, i, 0);
+    if(pte == 0)
+      continue;                 // 你有 lazy：页表项可能不存在
     if((*pte & PTE_V) == 0)
-      continue;   // physical page hasn't been allocated
+      continue;                 // 你有 lazy：物理页可能还没分配
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
-    }
-  }
-  return 0;
 
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
-  return -1;
+    // 如果原来可写：父子都改成只读 + 打 COW 标记
+    if(flags & PTE_W){
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;     // 关键：父进程 PTE 也要改
+    }
+
+    // 子进程映射到同一个物理页
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      uvmunmap(new, 0, i/PGSIZE, 1);
+      return -1;
+    }
+
+    // 新增一个引用
+    incref(pa);
+  }
+
+  sfence_vma();  // 父 PTE 被改写，建议 flush
+  return 0;
 }
+
 
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
@@ -334,6 +342,44 @@ uvmclear(pagetable_t pagetable, uint64 va)
   if(pte == 0)
     panic("uvmclear");
   *pte &= ~PTE_U;
+}
+
+static uint64
+cowalloc(pagetable_t pagetable, uint64 va)
+{
+  va = PGROUNDDOWN(va);
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0) return 0;
+  if((*pte & PTE_V) == 0) return 0;
+  if((*pte & PTE_U) == 0) return 0;
+
+  // 不是 COW：写只读页应该 kill（交给上层：返回 0）
+  if((*pte & PTE_COW) == 0)
+    return 0;
+
+  uint64 pa = PTE2PA(*pte);
+  uint flags = PTE_FLAGS(*pte);
+
+  // 优化：如果只有一个引用，直接恢复可写即可，不必拷贝
+  if(getref(pa) == 1){
+    *pte = PA2PTE(pa) | ((flags | PTE_W) & ~PTE_COW);
+    sfence_vma();
+    return pa;
+  }
+
+  char *mem = kalloc();
+  if(mem == 0)
+    return 0;
+
+  memmove(mem, (void*)pa, PGSIZE);
+
+  *pte = PA2PTE((uint64)mem) | ((flags | PTE_W) & ~PTE_COW);
+
+  // 旧页少一个引用：用你改过的 kfree 做 refcount--
+  kfree((void*)pa);
+
+  sfence_vma();
+  return (uint64)mem;
 }
 
 // Copy from kernel to user.
@@ -349,22 +395,35 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
-  
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      // lazy allocate
+      if((pa0 = vmfault(pagetable, va0, 0)) == 0)
         return -1;
-      }
     }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1;
+
+    // 如果不可写但 COW：先拆页
+    if(((*pte & PTE_W) == 0) && (*pte & PTE_COW)){
+      if(cowalloc(pagetable, va0) == 0)
+        return -1;
+      pa0 = walkaddr(pagetable, va0);
+      if(pa0 == 0)
+        return -1;
+      pte = walk(pagetable, va0, 0);
+    }
+
+    // 仍不可写：拒绝（例如写只读 text）
     if((*pte & PTE_W) == 0)
       return -1;
-      
+
     n = PGSIZE - (dstva - va0);
-    if(n > len)
-      n = len;
+    if(n > len) n = len;
+
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
@@ -452,25 +511,37 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
-  uint64 mem;
   struct proc *p = myproc();
 
-  if (va >= p->sz)
+  if(va >= p->sz)
     return 0;
+
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
-    return 0;
+
+  pte_t *pte = walk(pagetable, va, 0);
+
+  // 1) 已映射页的 fault：只处理 “写 COW”
+  if(pte && (*pte & PTE_V)){
+    if(read == 0){
+      return cowalloc(pagetable, va);   // 写入触发：尝试拆 COW
+    }
+    return 0; // 读 fault 不应到这里；或非法读，交给 trap kill
   }
-  mem = (uint64) kalloc();
+
+  // 2) 未映射：lazy allocation（保留你原逻辑）
+  uint64 mem = (uint64)kalloc();
   if(mem == 0)
     return 0;
-  memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
-    kfree((void *)mem);
+
+  memset((void*)mem, 0, PGSIZE);
+
+  if(mappages(pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0){
+    kfree((void*)mem);
     return 0;
   }
   return mem;
 }
+
 
 int
 ismapped(pagetable_t pagetable, uint64 va)
@@ -484,3 +555,5 @@ ismapped(pagetable_t pagetable, uint64 va)
   }
   return 0;
 }
+
+
