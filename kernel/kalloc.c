@@ -73,7 +73,7 @@ freerange(void *pa_start, void *pa_end)
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
-    refcnt[pa2idx((uint64)p)] = 1;   // 关键：配合 kfree 的 refcnt--
+    refcnt[pa2idx((uint64)p)] = 1;  
     kfree(p);
   }
 }
